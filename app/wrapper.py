@@ -314,7 +314,7 @@ async def search(
     not_first_floor:  Optional[str] = Query(None),
     only_last_floor:  Optional[str] = Query(None),
     page:      int = Query(1, ge=1),
-    per_page:  int = Query(100, ge=1, le=100),
+    per_page:  int = Query(200, ge=1, le=300),
     pages:     int = Query(3, ge=1, le=10),
 ):
     filters = {k: v for k, v in {
