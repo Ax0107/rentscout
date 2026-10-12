@@ -57,6 +57,17 @@ class DomofondParser(BaseParser):
         await rate_limiter.acquire("domofond")
 
         try:
+            # 1) curl_cffi с подменой TLS-отпечатка — без браузера.
+            from urllib.parse import urlencode
+
+            from app.utils.fetch import fetch_html
+
+            full_url = f"{url}?{urlencode(query_params)}" if query_params else url
+            html = await fetch_html(full_url)
+            if html:
+                return await self.postprocess_results(self._parse_html(html))
+
+            # 2) Фолбэк — обычный HTTP.
             async with httpx.AsyncClient(timeout=settings.REQUEST_TIMEOUT) as client:
                 response = await client.get(url, params=query_params)
                 response.raise_for_status()  # Raise an exception for bad status codes
@@ -149,9 +160,9 @@ class DomofondParser(BaseParser):
                 title = title_elem.get_text(strip=True) if title_elem else ""
                 
                 # Extract price (remove non-numeric characters except decimal point)
-                price_text = price_elem.get_text(strip=True) if price_elem else ""
-                price_digits = re.findall(r'[\d\s]+', price_text)
-                price = float(''.join(price_digits).replace(' ', '')) if price_digits else 0
+                price_text = price_elem.get_text(" ", strip=True) if price_elem else ""
+                price_digits = re.sub(r"\D", "", price_text)
+                price = float(price_digits) if price_digits else 0
                 
                 # Extract link
                 link_elem = item.select_one("a")

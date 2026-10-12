@@ -1,6 +1,8 @@
 import asyncio
 import httpx
+import json
 import logging
+import os
 import re
 from bs4 import BeautifulSoup
 from typing import Any, Dict, List, Optional
@@ -23,9 +25,21 @@ from app.utils.circuit_breaker import get_circuit_breaker, CircuitBreakerOpen
 
 logger = logging.getLogger(__name__)
 
+# Официальный BFF-search API Домклика: открыт (вне Qrator), пагинация offset/limit.
+DOMCLICK_API = "https://bff-search-web.domclick.ru/api/offers/v1"
+DOMCLICK_PAGE_LIMIT = int(os.getenv("DOMCLICK_PAGE_LIMIT", "30"))
+DOMCLICK_PAGES = int(os.getenv("DOMCLICK_PAGES", "30"))
+DOMCLICK_CONCURRENCY = int(os.getenv("DOMCLICK_CONCURRENCY", "6"))
+
 
 class DomclickParser(BaseParser):
     BASE_URL = "https://domclick.ru"
+
+    # guid региона для API (Москва проверен). Остальные города — добавлять сюда.
+    CITY_GUIDS = {
+        "москва": "1d1463ae-c80f-4d19-9331-a1b68a85b553",
+        "moscow": "1d1463ae-c80f-4d19-9331-a1b68a85b553",
+    }
 
     def __init__(self):
         super().__init__()
@@ -49,19 +63,31 @@ class DomclickParser(BaseParser):
         # Preprocess params
         processed_params = await self.preprocess_params(params)
 
-        # Build URL with params
-        # DomClick uses a different URL structure for different locations
-        location_slug = self._convert_location_to_slug(location)
-        url = f"{self.BASE_URL}/search/rent/living-space/all/{location_slug}"
-        query_params = self._build_query_params(processed_params)
+        op = (processed_params or {}).get("operation", "rent_long")
+        deal = "sale" if op == "sell" else "rent"
+        guid = self.CITY_GUIDS.get((location or "").strip().lower())
 
-        # Apply rate limiting
         await rate_limiter.acquire("domclick")
 
         try:
+            # 1) Лёгкий путь — BFF-search API Домклика (без браузера, с пагинацией).
+            if guid:
+                items = await self._fetch_via_api(guid, deal, processed_params)
+                if items:
+                    return await self.postprocess_results(items)
+
+            # 2) Фолбэк — браузер (Qrator) + разбор window.__SSR_STATE__.
+            url = f"{self.BASE_URL}/search?deal_type={deal}&offer_type=flat&offer_type=layout&category=living"
+            from app.utils.browser import fetch_rendered
+
+            html = await fetch_rendered(url)
+            if html:
+                return await self.postprocess_results(self._parse_html(html))
+
+            # 3) Последний фолбэк — обычный HTTP (Qrator отдаст 401, но пусть будет).
             async with httpx.AsyncClient(timeout=settings.REQUEST_TIMEOUT) as client:
-                response = await client.get(url, params=query_params)
-                response.raise_for_status()  # Raise an exception for bad status codes
+                response = await client.get(url)
+                response.raise_for_status()
                 results = self._parse_html(response.text)
                 return await self.postprocess_results(results)
         except asyncio.TimeoutError as e:
@@ -155,69 +181,165 @@ class DomclickParser(BaseParser):
                         
         return query_params
         
-    def _parse_html(self, html: str) -> list[PropertyCreate]:
-        soup = BeautifulSoup(html, "lxml")
-        properties = []
-        
-        # Find property listings
-        # Note: Actual selectors would need to be updated based on Domclick's current HTML structure
-        listings = soup.select("[data-testid='search-results-item']")  # Placeholder selector
-        
-        for item in listings:
+    async def _fetch_via_api(self, guid: str, deal: str, params: Dict[str, Any]) -> List[PropertyCreate]:
+        """Выдача через BFF-search API: параллельная пагинация offset/limit."""
+        from app.utils.fetch import fetch_many
+
+        limit = DOMCLICK_PAGE_LIMIT
+        pages = int((params or {}).get("pages") or DOMCLICK_PAGES)
+        common = (
+            f"address={guid}&limit={limit}&sort=qi&sort_dir=desc"
+            f"&deal_type={deal}&category=living&offer_type=flat"
+        )
+        urls = [f"{DOMCLICK_API}?offset={o}&{common}" for o in range(0, limit * pages, limit)]
+
+        bodies = await fetch_many(
+            urls,
+            concurrency=DOMCLICK_CONCURRENCY,
+            headers={"accept": "application/json"},
+        )
+
+        items: list = []
+        for body in bodies:
+            if not body:
+                continue
             try:
-                # Extract basic information
-                title_elem = item.select_one("[data-testid='item-title']")
-                price_elem = item.select_one("[data-testid='item-price']")
-                
-                if not all([title_elem, price_elem]):
-                    continue
-                    
-                # Extract title
-                title = title_elem.get_text(strip=True) if title_elem else ""
-                
-                # Extract price (remove non-numeric characters except decimal point)
-                price_text = price_elem.get_text(strip=True) if price_elem else ""
-                # Handle Russian price format (spaces as thousand separators)
-                price_clean = re.sub(r'[^\d,]', '', price_text).replace(',', '.')
-                price = float(price_clean) if price_clean else 0
-                
-                # Extract link
-                link_elem = item.select_one("a[href]")
-                link = link_elem.get("href", "") if link_elem else ""
-                if link and not link.startswith("http"):
-                    link = self.BASE_URL + link
-                    
-                # Parse title for rooms and area information
-                rooms = self._extract_rooms_from_title(title)
-                area = self._extract_area_from_title(title)
-                
-                # Extract photos
+                data = json.loads(body)
+                items.extend((data.get("result") or {}).get("items") or [])
+            except Exception as e:
+                logger.warning(f"Domclick API: bad json: {e}")
+
+        logger.info(f"Domclick API: {len(items)} items from {len(urls)} pages")
+        return self._parse_api_items(items)
+
+    def _parse_api_items(self, items: list) -> List[PropertyCreate]:
+        """Преобразовать items из API Домклика в PropertyCreate."""
+        results: List[PropertyCreate] = []
+        for it in items:
+            try:
+                info = it.get("objectInfo") or {}
+                loc = it.get("location") or {}
+                house = it.get("house") or {}
+                addr = (it.get("address") or {}).get("displayName")
+
+                bits = []
+                if info.get("rooms"):
+                    bits.append(f"{info['rooms']}-комн.")
+                if info.get("area"):
+                    bits.append(f"{info['area']} м²")
+                cx = (it.get("flatComplex") or {}).get("name")
+                if cx:
+                    bits.append(str(cx))
+                title = " ".join(bits) or (addr or "Объявление Домклик")
+
                 photos = []
-                img_elements = item.select("img")
-                for img in img_elements:
-                    if img.get("src"):
-                        photos.append(img["src"])
-                        
-                # Extract additional information
-                location = self._extract_location(item, title)
-                description = self._extract_description(item)
-                
+                for ph in (it.get("photos") or [])[:5]:
+                    u = ph.get("url") if isinstance(ph, dict) else ph
+                    if u and u.startswith("/"):
+                        u = "https://domclick.ru" + u
+                    if u:
+                        photos.append(u)
+
+                results.append(PropertyCreate(
+                    source="domclick",
+                    external_id=str(it.get("id") or ""),
+                    title=title,
+                    price=float(it.get("price") or 0),
+                    link=it.get("path"),
+                    rooms=info.get("rooms"),
+                    area=info.get("area"),
+                    floor=info.get("floor"),
+                    total_floors=house.get("floors"),
+                    address=addr,
+                    latitude=loc.get("lat"),
+                    longitude=loc.get("lon"),
+                    price_per_sqm=float(it["squarePrice"]) if it.get("squarePrice") else None,
+                    description=it.get("description"),
+                    photos=photos,
+                ))
+            except Exception as e:
+                logger.error(f"Domclick API item error: {e}")
+        return results
+
+    def _parse_html(self, html: str) -> list[PropertyCreate]:
+        """Домклик — SSR: офферы лежат в window.__SSR_STATE__ (JSON в <script>).
+
+        Парсим данные, а не DOM-карточки (в разметке карточек нет). В JSON
+        встречается JS-литерал undefined — приводим его к null.
+        """
+        import json as _json
+
+        blob = html.split("window.__SSR_STATE__=", 1)
+        if len(blob) != 2:
+            logger.warning("Domclick: window.__SSR_STATE__ не найден")
+            return []
+        body = re.sub(r"(?<=[:,\[])undefined", "null", blob[1].split("</script>", 1)[0]).strip().rstrip(";")
+        try:
+            data, _ = _json.JSONDecoder().raw_decode(body)
+        except Exception as e:
+            logger.error(f"Domclick: __SSR_STATE__ parse failed: {e}")
+            return []
+
+        offers: list = []
+
+        def walk(node):
+            if isinstance(node, dict):
+                if "offerId" in node and ("price" in node or "path" in node):
+                    offers.append(node)
+                for v in node.values():
+                    walk(v)
+            elif isinstance(node, list):
+                for v in node:
+                    walk(v)
+
+        walk(data)
+
+        properties: list[PropertyCreate] = []
+        for o in offers:
+            try:
+                info = o.get("generalInfo") or {}
+                loc = o.get("location") or {}
+                addr = (o.get("address") or {}).get("displayName")
+
+                bits = []
+                if info.get("rooms"):
+                    bits.append(f"{info['rooms']}-комн.")
+                if info.get("area"):
+                    bits.append(f"{info['area']} м²")
+                complex_name = (o.get("complex") or {}).get("name")
+                if complex_name:
+                    bits.append(str(complex_name))
+                title = " ".join(bits) or (addr or "Объявление Домклик")
+
+                photos = []
+                for ph in (o.get("photos") or [])[:5]:
+                    if isinstance(ph, dict):
+                        u = ph.get("url") or ph.get("path")
+                        if u:
+                            photos.append(u)
+                    elif isinstance(ph, str):
+                        photos.append(ph)
+
                 props = {
                     "source": "domclick",
-                    "external_id": self._extract_external_id(link),
+                    "external_id": str(o.get("offerId") or o.get("id") or ""),
                     "title": title,
-                    "price": price,
-                    "link": link,
-                    "rooms": rooms,
-                    "area": area,
-                    "photos": photos[:5],  # Limit to 5 photos
-                    "location": location,
-                    "description": description,
+                    "price": float(o.get("price") or 0),
+                    "link": o.get("path"),
+                    "rooms": info.get("rooms"),
+                    "area": info.get("area"),
+                    "floor": info.get("minFloor"),
+                    "total_floors": info.get("floors"),
+                    "address": addr,
+                    "latitude": loc.get("lat"),
+                    "longitude": loc.get("lon"),
+                    "photos": photos,
                 }
                 properties.append(PropertyCreate(**props))
             except Exception as e:
-                logger.error(f"Error parsing item: {e}")
-                
+                logger.error(f"Error parsing domclick offer: {e}")
+
+        logger.info(f"Domclick: parsed {len(properties)} offers from SSR state")
         return properties
         
     def _extract_rooms_from_title(self, title: str) -> int:

@@ -4,7 +4,7 @@
 import asyncio
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 import httpx
 from app.utils.enhanced_http import EnhancedHTTPClient
@@ -29,6 +29,7 @@ class ParserConfig:
     rate_limit: int = 10  # requests per second
     max_concurrent: int = 5
     cache_ttl: int = 300  # seconds
+    headers: Dict[str, str] = field(default_factory=dict)
 
 
 class OptimizedBaseParser(ABC):

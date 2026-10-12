@@ -376,19 +376,26 @@ __all__ = [
     "circuit_breaker",
 ]
 
-# Factory function для обратной совместимости
-async def get_circuit_breaker(
+# Factory function для обратной совместимости.
+# Синхронная: парсеры зовут её без await
+# (circuit_breaker = get_circuit_breaker("cian")) и затем
+# await circuit_breaker.call_async(...). Async-версия возвращала корутину,
+# и вызов .call_async падал с 'coroutine' object has no attribute 'call_async'.
+def get_circuit_breaker(
     service_name: str,
     config: Optional[CircuitBreakerConfig] = None
 ) -> CircuitBreaker:
     """
     Получить или создать circuit breaker для сервиса.
-    
+
     Args:
         service_name: Имя сервиса
         config: Опциональная конфигурация
-        
+
     Returns:
         CircuitBreaker instance
     """
-    return await CircuitBreaker.get_breaker(service_name, config)
+    if service_name not in CircuitBreaker._breakers:
+        CircuitBreaker._breakers[service_name] = CircuitBreaker(service_name, config)
+        logger.info(f"Created circuit breaker for '{service_name}'")
+    return CircuitBreaker._breakers[service_name]

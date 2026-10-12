@@ -27,6 +27,16 @@ logger = logging.getLogger(__name__)
 class AvitoParser(BaseParser):
     BASE_URL = "https://www.avito.ru"
 
+    # Авито использует латинские слэги в пути; кириллица в /{location}/ даёт 404.
+    CITY_SLUGS = {
+        "москва": "moskva", "moscow": "moskva",
+        "санкт-петербург": "sankt-peterburg", "спб": "sankt-peterburg",
+        "новосибирск": "novosibirsk", "екатеринбург": "ekaterinburg",
+        "казань": "kazan", "нижний новгород": "nizhniy_novgorod",
+        "краснодар": "krasnodar", "сочи": "sochi", "самара": "samara",
+        "уфа": "ufa", "ростов-на-дону": "rostov-na-donu", "челябинск": "chelyabinsk",
+    }
+
     def __init__(self):
         super().__init__()
         self.name = "AvitoParser"
@@ -50,12 +60,21 @@ class AvitoParser(BaseParser):
         processed_params = await self.preprocess_params(params)
 
         # Build URL with params
-        url = f"{self.BASE_URL}/{location}/sdam/na_sutki"
+        slug = self.CITY_SLUGS.get(location.strip().lower())
+        url = f"{self.BASE_URL}/{slug}/kvartiry/sdam" if slug else f"{self.BASE_URL}/rossiya/kvartiry/sdam"
 
         # Apply rate limiting
         await rate_limiter.acquire("avito")
 
         try:
+            # 1) curl_cffi с подменой отпечатка — без браузера.
+            from app.utils.fetch import fetch_html
+
+            html = await fetch_html(url)
+            if html:
+                return await self.postprocess_results(self._parse_html(html))
+
+            # 2) Фолбэк — обычный HTTP (если рендер выключен/не смог).
             async with httpx.AsyncClient(timeout=settings.REQUEST_TIMEOUT) as client:
                 response = await client.get(url)
                 response.raise_for_status()  # Raise an exception for bad status codes

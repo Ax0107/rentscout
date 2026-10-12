@@ -2,7 +2,7 @@
 API эндпоинты для 2FA (Two-Factor Authentication).
 """
 
-from fastapi import APIRouter, Depends, HTTPException, status, Request
+from fastapi import APIRouter, Depends, HTTPException, status, Request, Body
 from pydantic import BaseModel, Field
 from typing import Optional
 import json
@@ -246,7 +246,7 @@ async def disable_2fa(
 )
 async def verify_2fa(
     request: Request,
-    code: str = Field(..., description="TOTP код или backup код"),
+    code: str = Body(..., embed=True, description="TOTP код или backup код"),
     current_user: TokenData = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ) -> dict:

@@ -8,7 +8,10 @@ from pydantic_settings import BaseSettings
 class Settings(BaseSettings):
     """Конфигурация приложения с валидацией переменных окружения."""
 
-    model_config = ConfigDict(env_file=".env", env_file_encoding="utf-8")
+    # extra="ignore": .env содержит служебные ключи (ENABLE_*_PARSER, ML_*,
+    # RATE_LIMIT_*, POSTGRES_* и т.п.), которых нет в модели. Со strict-дефолтом
+    # pydantic-settings отбивал их ValidationError'ом и приложение не стартовало.
+    model_config = ConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     # Application settings
     APP_NAME: str = Field(default="RentScout", description="Название приложения")
@@ -89,11 +92,20 @@ class Settings(BaseSettings):
     @field_validator("DATABASE_URL")
     @classmethod
     def validate_database_url(cls, v: str) -> str:
-        """Валидация URL PostgreSQL."""
+        """Валидация URL PostgreSQL.
+
+        Все потребители (app/db/models/session.py, alembic/env.py) создают
+        АСИНХРОННЫЙ движок, поэтому синхронный драйвер `postgresql://`
+        приводим к `postgresql+asyncpg://`: иначе create_async_engine падает
+        с "Pool class AsyncAdaptedQueuePool cannot be used with non-asyncio
+        engine".
+        """
         if not v:
             raise ValueError("DATABASE_URL не установлен. Проверьте .env файл")
         if not v.startswith(("postgresql://", "postgresql+asyncpg://")):
             raise ValueError("DATABASE_URL должен начинаться с postgresql:// или postgresql+asyncpg://")
+        if v.startswith("postgresql://"):
+            v = "postgresql+asyncpg://" + v[len("postgresql://"):]
         return v
 
     @field_validator("REDIS_URL")

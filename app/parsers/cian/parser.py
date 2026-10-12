@@ -1,6 +1,7 @@
 import asyncio
 import httpx
 import logging
+import os
 import re
 from bs4 import BeautifulSoup
 from typing import Any, Dict, List, Optional
@@ -22,6 +23,10 @@ from app.utils.ratelimiter import rate_limiter
 from app.utils.circuit_breaker import get_circuit_breaker, CircuitBreakerOpen
 
 logger = logging.getLogger(__name__)
+
+# Сколько страниц выдачи тянуть и с какой параллельностью (cat.php ~28 карточек/стр.).
+CIAN_PAGES = int(os.getenv("CIAN_PAGES", "100"))
+CIAN_CONCURRENCY = int(os.getenv("CIAN_CONCURRENCY", "5"))
 
 
 class CianParser(BaseParser):
@@ -57,7 +62,39 @@ class CianParser(BaseParser):
         await rate_limiter.acquire("cian")
 
         try:
-            # Используем оптимизированный HTTP клиент из пула
+            # 1) Основной путь — curl_cffi с подменой TLS-отпечатка, без браузера.
+            #    Страницы тянем параллельно и склеиваем с дедупом по ссылке.
+            from urllib.parse import urlencode
+
+            from app.utils.fetch import fetch_many
+
+            pages = int((processed_params or {}).get("pages") or CIAN_PAGES)
+            urls = []
+            for p in range(1, pages + 1):
+                qp = dict(query_params)
+                if p > 1:
+                    qp["p"] = p
+                urls.append(f"{url}?{urlencode(qp)}" if qp else url)
+
+            htmls = await fetch_many(urls, concurrency=CIAN_CONCURRENCY)
+
+            items: List[PropertyCreate] = []
+            seen: set = set()
+            for html in htmls:
+                if not html:
+                    continue
+                for it in self._parse_html(html):
+                    link = getattr(it, "link", None)
+                    if link and link in seen:
+                        continue
+                    if link:
+                        seen.add(link)
+                    items.append(it)
+
+            if items:
+                return await self.postprocess_results(items)
+
+            # 2) Последний фолбэк — обычный HTTP-пул.
             from app.utils.http_pool import OptimizedHTTPClient
 
             async with OptimizedHTTPClient(name="cian") as client:
@@ -174,19 +211,19 @@ class CianParser(BaseParser):
         for item in listings:
             try:
                 # Extract basic information
-                title_elem = item.select_one("[data-name='Title']")
-                price_elem = item.select_one("[data-name='Price']") or item.select_one("[data-mark='MainPrice']")
+                title_elem = item.select_one("[data-mark='OfferTitle']") or item.select_one("[data-mark='OfferSubtitle']") or item.select_one("[data-name='Title']")
+                price_elem = item.select_one("[data-mark='MainPrice']") or item.select_one("[data-name='Price']")
                 
-                if not all([title_elem, price_elem]):
+                if title_elem is None and price_elem is None:
                     continue
                     
                 # Extract title
                 title = title_elem.get_text(strip=True) if title_elem else ""
                 
                 # Extract price (remove non-numeric characters except decimal point)
-                price_text = price_elem.get_text(strip=True) if price_elem else ""
-                price_digits = re.findall(r'[\d\s]+', price_text)
-                price = float(''.join(price_digits).replace(' ', '')) if price_digits else 0
+                price_text = price_elem.get_text(" ", strip=True) if price_elem else ""
+                price_digits = re.sub(r"\D", "", price_text)
+                price = float(price_digits) if price_digits else 0
                 
                 # Extract link
                 link_elem = item.select_one("a")

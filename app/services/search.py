@@ -3,7 +3,7 @@ import logging
 import time
 from typing import List, Dict, Any
 
-from app.db.batch_insert import bulk_insert_with_deduplication
+from app.db.batch_insert import bulk_upsert_with_deduplication
 from app.models.schemas import Property
 from app.parsers.avito.parser import AvitoParser
 from app.parsers.cian.parser import CianParser

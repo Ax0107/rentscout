@@ -125,7 +125,10 @@ try:
     from app.api.graphql import graphql_app
     app.include_router(graphql_app, prefix="/graphql")
     logger.info("✅ GraphQL API enabled at /graphql")
-except ImportError as e:
+except Exception as e:
+    # GraphQL — опциональная фича. Ловим не только ImportError: при отсутствии
+    # strawberry подставляется стаб, а его роутер несовместим с новым FastAPI
+    # (AttributeError: _contains_router) — приложению из-за этого падать нельзя.
     logger.warning(f"GraphQL not available: {e}. Install with: pip install strawberry-graphql")
 
 # Инициализация Prometheus инструментатора

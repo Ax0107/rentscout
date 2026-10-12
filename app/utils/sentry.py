@@ -257,7 +257,9 @@ def capture_message(message: str, level: str = "info", context: dict = None) -> 
     return event_id
 
 
-def start_transaction(name: str, op: str = "function") -> sentry_sdk.Transaction:
+def start_transaction(name: str, op: str = "function") -> "sentry_sdk.Transaction":
+    # Аннотация строкой: в sentry-sdk 2.x атрибута sentry_sdk.Transaction нет,
+    # а вычисление аннотации при импорте модуля роняло приложение.
     """
     Начинает транзакцию для трассировки производительности.
 

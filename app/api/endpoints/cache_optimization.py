@@ -6,7 +6,7 @@ managing memory usage, and analyzing compression effectiveness.
 """
 
 from fastapi import APIRouter, Query, HTTPException
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from datetime import datetime
 
 from app.utils.cache_optimization import (

@@ -12,6 +12,9 @@ from datetime import datetime
 
 from prometheus_client import Counter, Histogram, Gauge, Summary
 from app.utils.logger import logger
+# Одна метрика memory_usage_bytes на процесс: повторное объявление Gauge
+# с тем же именем падает DuplicateTimeseries в дефолтном реестре Prometheus.
+from app.utils.metrics import MEMORY_USAGE  # noqa: F401
 
 
 # Performance metrics
@@ -34,10 +37,8 @@ SLOW_QUERIES = Counter(
     ['operation_type', 'threshold']
 )
 
-MEMORY_USAGE = Gauge(
-    'memory_usage_bytes',
-    'Current memory usage in bytes'
-)
+# MEMORY_USAGE импортирован из app.utils.metrics — одна метрика
+# memory_usage_bytes на процесс (иначе DuplicateTimeseries в реестре).
 
 ACTIVE_TASKS = Gauge(
     'active_tasks',

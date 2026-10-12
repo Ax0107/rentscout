@@ -101,6 +101,11 @@ class ProxyManager:
                                     username=username,
                                     password=password
                                 ))
+                            except (ValueError, IndexError) as e:
+                                # Битая строка в файле прокси не должна ронять
+                                # загрузку всего списка — пропускаем ее.
+                                logger.debug(f"Пропускаю некорректную строку прокси {entry!r}: {e}")
+                                continue
                     logger.info(f"Loaded {len(self.proxies)} proxies from {path}")
                 else:
                     logger.warning(f"Proxy file not found: {path}")

@@ -1,6 +1,7 @@
 import asyncio
 import httpx
 import logging
+import os
 import re
 from bs4 import BeautifulSoup
 from typing import Any, Dict, List, Optional
@@ -23,9 +24,23 @@ from app.utils.circuit_breaker import get_circuit_breaker, CircuitBreakerOpen
 
 logger = logging.getLogger(__name__)
 
+# Сколько страниц выдачи Яндекса тянуть и с какой параллельностью.
+YANDEX_PAGES = int(os.getenv("YANDEX_PAGES", "25"))
+YANDEX_CONCURRENCY = int(os.getenv("YANDEX_CONCURRENCY", "4"))
+
 
 class YandexRealtyParser(BaseParser):
     BASE_URL = "https://realty.yandex.ru"
+
+    # Слэги городов в URL Яндекс.Недвижимости.
+    CITY_SLUGS = {
+        "москва": "moskva", "moscow": "moskva",
+        "санкт-петербург": "sankt-peterburg", "спб": "sankt-peterburg",
+        "новосибирск": "novosibirsk", "екатеринбург": "ekaterinburg",
+        "казань": "kazan", "нижний новгород": "nizhniy-novgorod",
+        "краснодар": "krasnodar", "сочи": "sochi", "самара": "samara",
+        "уфа": "ufa", "ростов-на-дону": "rostov-na-donu", "челябинск": "chelyabinsk",
+    }
 
     def __init__(self):
         super().__init__()
@@ -49,16 +64,65 @@ class YandexRealtyParser(BaseParser):
         # Preprocess params
         processed_params = await self.preprocess_params(params)
 
-        # Build URL with params
-        url = f"{self.BASE_URL}/search/"
-        query_params = self._build_query_params(location, processed_params)
+        # Текущий URL Яндекс.Недвижимости — /{city}/{deal}/kvartira/ (SSR).
+        # Старый /search/?region=… отдавал 301.
+        from urllib.parse import urlencode
+
+        slug = self.CITY_SLUGS.get(location.strip().lower(), "rossiya")
+        op = (processed_params or {}).get("operation", "rent_long")
+        deal = "kupit" if op == "sell" else "snyat"
+        url = f"{self.BASE_URL}/{slug}/{deal}/kvartira/"
+
+        q: Dict[str, Any] = {}
+        if processed_params:
+            rooms = processed_params.get("rooms")
+            if rooms:
+                try:
+                    q["roomsTotal"] = int(rooms)
+                except (TypeError, ValueError):
+                    pass
+            if processed_params.get("min_price"):
+                q["priceMin"] = int(processed_params["min_price"])
+            if processed_params.get("max_price"):
+                q["priceMax"] = int(processed_params["max_price"])
 
         # Apply rate limiting
         await rate_limiter.acquire("yandex_realty")
 
         try:
+            # 1) curl_cffi с подменой TLS-отпечатка, без браузера.
+            #    Страницы тянем параллельно и склеиваем с дедупом по ссылке.
+            from app.utils.fetch import fetch_many
+
+            pages = int((processed_params or {}).get("pages") or YANDEX_PAGES)
+            urls = []
+            for p in range(1, pages + 1):
+                qq = dict(q)
+                if p > 1:
+                    qq["page"] = p
+                urls.append(f"{url}?{urlencode(qq)}" if qq else url)
+
+            htmls = await fetch_many(urls, concurrency=YANDEX_CONCURRENCY)
+
+            items: List[PropertyCreate] = []
+            seen: set = set()
+            for html in htmls:
+                if not html:
+                    continue
+                for it in self._parse_html(html):
+                    link = getattr(it, "link", None)
+                    if link and link in seen:
+                        continue
+                    if link:
+                        seen.add(link)
+                    items.append(it)
+
+            if items:
+                return await self.postprocess_results(items)
+
+            # 2) Фолбэк — обычный HTTP.
             async with httpx.AsyncClient(timeout=settings.REQUEST_TIMEOUT) as client:
-                response = await client.get(url, params=query_params)
+                response = await client.get(url, params=q)
                 response.raise_for_status()  # Raise an exception for bad status codes
                 results = self._parse_html(response.text)
                 return await self.postprocess_results(results)
@@ -155,24 +219,24 @@ class YandexRealtyParser(BaseParser):
         
         # Find property listings
         # Note: Actual selectors would need to be updated based on Yandex Realty's current HTML structure
-        listings = soup.select("[data-name='OfferCard']")  # Placeholder selector
+        listings = soup.select("li[class*='OffersSerpItem']")
         
         for item in listings:
             try:
                 # Extract basic information
-                title_elem = item.select_one("[data-mark='OfferTitle']")
-                price_elem = item.select_one("[data-mark='MainPrice']")
+                title_elem = item.select_one("[class*='OffersSerpItem__titleLink']") or item.select_one("a[href*='/offer/']")
+                price_elem = item.select_one("[class*='OffersSerpItem__price']")
                 
                 if not all([title_elem, price_elem]):
                     continue
                     
                 # Extract title
-                title = title_elem.get_text(strip=True) if title_elem else ""
+                title = (title_elem.get("aria-label") or title_elem.get_text(" ", strip=True)) if title_elem else ""
                 
                 # Extract price (remove non-numeric characters except decimal point)
-                price_text = price_elem.get_text(strip=True) if price_elem else ""
-                price_digits = re.findall(r'[\d\s]+', price_text)
-                price = float(''.join(price_digits).replace(' ', '')) if price_digits else 0
+                price_text = price_elem.get_text(" ", strip=True) if price_elem else ""
+                price_digits = re.sub(r"\D", "", price_text)
+                price = float(price_digits) if price_digits else 0
                 
                 # Extract link
                 link_elem = item.select_one("a")
