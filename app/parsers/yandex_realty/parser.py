@@ -235,8 +235,15 @@ class YandexRealtyParser(BaseParser):
                 
                 # Extract price (remove non-numeric characters except decimal point)
                 price_text = price_elem.get_text(" ", strip=True) if price_elem else ""
-                price_digits = re.sub(r"\D", "", price_text)
+                # Берём ПЕРВОЕ число, а не все цифры подряд: в блоке цены
+                # иногда оказываются метраж/цена за метр, и склейка всех цифр
+                # давала мусор вида 4.3e16 (и импорт падал «Out of range»).
+                m_price = re.search(r"\d[\d\s\u00a0]*(?:[.,]\d+)?", price_text)
+                price_digits = re.sub(r"\D", "", m_price.group(0)) if m_price else ""
                 price = float(price_digits) if price_digits else 0
+                # Санитарный порог: жильё в РФ дешевле 1e10 ₽; выше — ошибка разбора.
+                if price > 1e10:
+                    price = 0
                 
                 # Extract link
                 link_elem = item.select_one("a")
