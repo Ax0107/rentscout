@@ -19,7 +19,6 @@ from typing import Any, Dict, List, Optional
 import redis.asyncio as aioredis
 from fastapi import FastAPI, HTTPException, Query
 
-from app.parsers.avito.parser import AvitoParser
 from app.parsers.cian.parser import CianParser
 from app.parsers.domclick.parser import DomclickParser
 from app.parsers.yandex_realty.parser import YandexRealtyParser
@@ -32,11 +31,12 @@ CACHE_TTL = 600      # 10 min — выдача поиска
 ITEM_TTL  = 86400    # 24h — отдельные карточки
 
 # Ключ источника → (человеческое имя, класс парсера, корневой URL площадки)
+# avito убран: с него жёсткий IP-бан (403/429), из выдачи он приносит 0 и
+# только жжёт время и дёргает предохранитель. Вернём, когда будет чистый IP.
 SOURCES: Dict[str, tuple] = {
     "cian":     ("Циан",                 CianParser,        "https://www.cian.ru/"),
     "yandex":   ("Яндекс Недвижимость",  YandexRealtyParser, "https://realty.yandex.ru/"),
     "domclick": ("Домклик",              DomclickParser,    "https://domclick.ru/"),
-    "avito":    ("Авито",                AvitoParser,       "https://www.avito.ru/"),
 }
 
 
