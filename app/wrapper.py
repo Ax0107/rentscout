@@ -81,6 +81,8 @@ def _params(filters: Dict[str, Any]) -> Dict[str, Any]:
         "price_max": _int(filters.get("price_max")),
         "type": filters.get("type") or None,
         "search": filters.get("search") or None,
+        # Сколько страниц тянуть у площадок: сбор просит много, диалог — мало.
+        "pages": _int(filters.get("pages")),
     }
     return {k: v for k, v in raw.items() if v is not None}
 
@@ -197,8 +199,14 @@ def _apply_filters(items: List[Dict[str, Any]], filters: Dict[str, Any]) -> List
     return out
 
 
-async def _run_source(key: str, location: str, filters: Dict[str, Any], timeout: float = 90) -> List[Dict[str, Any]]:
-    """Прогнать один парсер, смапить в items и применить фильтры."""
+async def _run_source(key: str, location: str, filters: Dict[str, Any], timeout: float = 300) -> List[Dict[str, Any]]:
+    """Прогнать один парсер, смапить в items и применить фильтры.
+
+    timeout большой: глубокий сбор (pages=100) у Циана идёт дольше, и раньше
+    его срезало на 90с — в выдаче оставались только Яндекс и Домклик.
+    """
+    if timeout is None:
+        timeout = float(os.getenv("RUN_SOURCE_TIMEOUT", "300"))
     label, parser_cls, _ = SOURCES[key]
     params = _params(filters)
     property_type = filters.get("type") or "apartment"
@@ -315,7 +323,7 @@ async def search(
     only_last_floor:  Optional[str] = Query(None),
     page:      int = Query(1, ge=1),
     per_page:  int = Query(200, ge=1, le=300),
-    pages:     int = Query(3, ge=1, le=10),
+    pages:     Optional[int] = Query(None, ge=1, le=200),
 ):
     filters = {k: v for k, v in {
         "search": search, "city": city, "type": type, "operation": operation,
@@ -323,6 +331,7 @@ async def search(
         "area_min": area_min, "area_max": area_max,
         "floor_min": floor_min, "floor_max": floor_max,
         "not_first_floor": not_first_floor, "only_last_floor": only_last_floor,
+        "pages": pages,
     }.items() if v not in (None, "")}
 
     location = filters.get("city") or "Москва"
