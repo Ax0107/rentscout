@@ -14,6 +14,7 @@ import hashlib
 import json
 import logging
 import os
+import time
 from itertools import zip_longest
 from typing import Any, Dict, List, Optional
 
@@ -228,6 +229,53 @@ app = FastAPI(title="AIOPA External Scraper", version="0.3.0")
 _redis: Optional[aioredis.Redis] = None
 
 
+# ---- Кэш: Redis, а без него — память процесса ----
+# Раньше /item и /detail при отсутствии Redis отдавали 503, и страница
+# объекта в AIOPA падала в 404: карточка жила только в кэше. Теперь есть
+# резервный кэш в памяти воркера (один процесс) — страница открывается и
+# без Redis.
+_mem: Dict[str, tuple] = {}
+
+
+def _mem_set(key: str, val: str, ttl: int) -> None:
+    if len(_mem) > 5000:
+        now = time.time()
+        for k in [k for k, (e, _) in _mem.items() if e < now]:
+            _mem.pop(k, None)
+        if len(_mem) > 5000:
+            _mem.clear()
+    _mem[key] = (time.time() + ttl, val)
+
+
+def _mem_get(key: str) -> Optional[str]:
+    v = _mem.get(key)
+    if not v:
+        return None
+    exp, val = v
+    if exp < time.time():
+        _mem.pop(key, None)
+        return None
+    return val
+
+
+async def cache_get(key: str) -> Optional[str]:
+    if _redis:
+        try:
+            return await _redis.get(key)
+        except Exception as e:
+            logger.debug(f"redis get err: {e}")
+    return _mem_get(key)
+
+
+async def cache_set(key: str, val: str, ttl: int) -> None:
+    _mem_set(key, val, ttl)
+    if _redis:
+        try:
+            await _redis.setex(key, ttl, val)
+        except Exception as e:
+            logger.debug(f"redis set err: {e}")
+
+
 @app.on_event("startup")
 async def on_startup():
     global _redis
@@ -282,14 +330,10 @@ async def search(
     cache_key = "aiopa:ext:" + json.dumps(
         {**filters, "_city": location}, sort_keys=True, ensure_ascii=False
     )
-    if _redis:
-        try:
-            cached = await _redis.get(cache_key)
-            if cached:
-                logger.info(f"cache hit: {cache_key}")
-                return json.loads(cached)
-        except Exception as e:
-            logger.debug(f"cache read err: {e}")
+    cached = await cache_get(cache_key)
+    if cached:
+        logger.info(f"cache hit: {cache_key}")
+        return json.loads(cached)
 
     # Парсеры сами ходят по страницам (CIAN_PAGES/YANDEX_PAGES/DOMCLICK_PAGES),
     # поэтому воркер дёргает каждый источник один раз и параллельно.
@@ -323,28 +367,18 @@ async def search(
         "filters": filters,
     }
 
-    if _redis and merged:
-        try:
-            pipe = _redis.pipeline()
-            for it in merged:
-                if it.get("id"):
-                    pipe.setex(f"aiopa:ext_item:{it['id']}", ITEM_TTL, json.dumps(it, ensure_ascii=False))
-            await pipe.execute()
-        except Exception as e:
-            logger.debug(f"per-item cache write err: {e}")
-        try:
-            await _redis.setex(cache_key, CACHE_TTL, json.dumps(payload, ensure_ascii=False))
-        except Exception as e:
-            logger.debug(f"cache write err: {e}")
+    if merged:
+        for it in merged:
+            if it.get("id"):
+                await cache_set(f"aiopa:ext_item:{it['id']}", json.dumps(it, ensure_ascii=False), ITEM_TTL)
+        await cache_set(cache_key, json.dumps(payload, ensure_ascii=False), CACHE_TTL)
 
     return payload
 
 
 @app.get("/item/{item_id}")
 async def get_item(item_id: str):
-    if not _redis:
-        raise HTTPException(503, "cache unavailable")
-    data = await _redis.get(f"aiopa:ext_item:{item_id}")
+    data = await cache_get(f"aiopa:ext_item:{item_id}")
     if not data:
         raise HTTPException(404, "item not found")
     return json.loads(data)
@@ -357,9 +391,7 @@ async def get_detail(item_id: str):
     Отдельного detail-скрейпа здесь больше нет: данные по объекту целиком
     приходят из app/parsers при поиске, а браузерный обход карточек убран.
     """
-    if not _redis:
-        raise HTTPException(503, "cache unavailable")
-    card_data = await _redis.get(f"aiopa:ext_item:{item_id}")
+    card_data = await cache_get(f"aiopa:ext_item:{item_id}")
     if not card_data:
         raise HTTPException(404, "item not found")
     return json.loads(card_data)
