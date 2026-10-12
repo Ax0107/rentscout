@@ -103,14 +103,19 @@ def _to_item(p: Any, source: str, operation: str, property_type: str) -> Optiona
             price_per_m = None
 
     photos = list(getattr(p, "photos", None) or [])
-    op_type = "rent" if "rent" in (operation or "") else "sale"
+    # НЕ схлопываем до rent/sale: аренда долгосрочная и посуточная — разные
+    # типы (в базе sell|rent_long|rent_short), терять разницу нельзя.
+    op_norm = operation if operation in ("sell", "rent_long", "rent_short") else (
+        "rent_long" if "rent" in (operation or "") else "sell"
+    )
 
     return {
         "source":         source,
         "source_label":   SOURCES[source][0],
         "title":          getattr(p, "title", None) or "Объявление",
         "subtitle":       None,
-        "operation_type": op_type,
+        "operation":      op_norm,
+        "operation_type": op_norm,
         "property_type":  property_type,
         "price":          format_price(price_raw),
         "price_raw":      price_raw,
