@@ -127,8 +127,76 @@ def _to_item(p: Any, source: str, operation: str, property_type: str) -> Optiona
     }
 
 
+def _num(v):
+    try:
+        return float(str(v).replace(" ", "").replace("\u00a0", ""))
+    except (TypeError, ValueError):
+        return None
+
+
+def _truthy(v) -> bool:
+    return str(v).lower() in ("1", "true", "yes", "on", "да")
+
+
+def _apply_filters(items: List[Dict[str, Any]], filters: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Применить все фильтры к готовым items.
+
+    Площадки большинство слотов в запросе игнорируют, поэтому фильтруем здесь —
+    в микросервисе, а не на стороне AIOPA: rentscout — единственное место, где
+    известны и данные, и фильтры. Нет данных в элементе — не отбрасываем
+    (потерять годный объект хуже, чем показать лишний).
+    """
+    pmin, pmax = _num(filters.get("price_min")), _num(filters.get("price_max"))
+    rooms = _num(filters.get("rooms"))
+    amin, amax = _num(filters.get("area_min")), _num(filters.get("area_max"))
+    fmin, fmax = _num(filters.get("floor_min")), _num(filters.get("floor_max"))
+    nff = _truthy(filters.get("not_first_floor"))
+    lastf = _truthy(filters.get("only_last_floor"))
+
+    out = []
+    for it in items:
+        price = it.get("price_raw") or 0
+        if price:
+            if pmin and price < pmin:
+                continue
+            if pmax and price > pmax:
+                continue
+
+        r = it.get("rooms")
+        if rooms and r is not None:
+            r = int(r)
+            if rooms >= 4:
+                if r < 4:
+                    continue
+            elif r != int(rooms):
+                continue
+
+        a = _num(it.get("area"))
+        if a is not None:
+            if amin and a < amin:
+                continue
+            if amax and a > amax:
+                continue
+
+        fl = _num(it.get("floor"))
+        if fl is not None:
+            if fmin and fl < fmin:
+                continue
+            if fmax and fl > fmax:
+                continue
+            if nff and fl == 1:
+                continue
+        if lastf:
+            tf = _num(it.get("total_floors"))
+            if fl is not None and tf is not None and fl != tf:
+                continue
+
+        out.append(it)
+    return out
+
+
 async def _run_source(key: str, location: str, filters: Dict[str, Any], timeout: float = 90) -> List[Dict[str, Any]]:
-    """Прогнать один парсер и смапить результат в items."""
+    """Прогнать один парсер, смапить в items и применить фильтры."""
     label, parser_cls, _ = SOURCES[key]
     params = _params(filters)
     property_type = filters.get("type") or "apartment"
@@ -149,7 +217,7 @@ async def _run_source(key: str, location: str, filters: Dict[str, Any], timeout:
             continue
         seen.add(it["url"])
         items.append(it)
-    return items
+    return _apply_filters(items, filters)
 
 
 # ============================ FastAPI app ============================
@@ -190,6 +258,12 @@ async def search(
     rooms:     Optional[str] = Query(None),
     price_min: Optional[str] = Query(None),
     price_max: Optional[str] = Query(None),
+    area_min:  Optional[str] = Query(None),
+    area_max:  Optional[str] = Query(None),
+    floor_min: Optional[str] = Query(None),
+    floor_max: Optional[str] = Query(None),
+    not_first_floor:  Optional[str] = Query(None),
+    only_last_floor:  Optional[str] = Query(None),
     page:      int = Query(1, ge=1),
     per_page:  int = Query(100, ge=1, le=100),
     pages:     int = Query(3, ge=1, le=10),
@@ -197,7 +271,10 @@ async def search(
     filters = {k: v for k, v in {
         "search": search, "city": city, "type": type, "operation": operation,
         "rooms": rooms, "price_min": price_min, "price_max": price_max,
-    }.items() if v}
+        "area_min": area_min, "area_max": area_max,
+        "floor_min": floor_min, "floor_max": floor_max,
+        "not_first_floor": not_first_floor, "only_last_floor": only_last_floor,
+    }.items() if v not in (None, "")}
 
     location = filters.get("city") or "Москва"
 
