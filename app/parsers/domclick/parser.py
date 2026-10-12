@@ -30,6 +30,9 @@ DOMCLICK_API = "https://bff-search-web.domclick.ru/api/offers/v1"
 DOMCLICK_PAGE_LIMIT = int(os.getenv("DOMCLICK_PAGE_LIMIT", "30"))
 DOMCLICK_PAGES = int(os.getenv("DOMCLICK_PAGES", "30"))
 DOMCLICK_CONCURRENCY = int(os.getenv("DOMCLICK_CONCURRENCY", "6"))
+# Хост картинок: API отдаёт относительные пути (/rent/offer/…, /vitrina/…),
+# а на самом domclick.ru они дают 404. Рабочий хост — img.domclick.ru.
+DOMCLICK_IMG = os.getenv("DOMCLICK_IMG", "https://img.domclick.ru")
 
 
 class DomclickParser(BaseParser):
@@ -236,7 +239,7 @@ class DomclickParser(BaseParser):
                 for ph in (it.get("photos") or [])[:5]:
                     u = ph.get("url") if isinstance(ph, dict) else ph
                     if u and u.startswith("/"):
-                        u = "https://domclick.ru" + u
+                        u = DOMCLICK_IMG + u
                     if u:
                         photos.append(u)
 
@@ -313,12 +316,15 @@ class DomclickParser(BaseParser):
 
                 photos = []
                 for ph in (o.get("photos") or [])[:5]:
+                    u = None
                     if isinstance(ph, dict):
                         u = ph.get("url") or ph.get("path")
-                        if u:
-                            photos.append(u)
                     elif isinstance(ph, str):
-                        photos.append(ph)
+                        u = ph
+                    if u and u.startswith("/"):
+                        u = DOMCLICK_IMG + u
+                    if u:
+                        photos.append(u)
 
                 props = {
                     "source": "domclick",
