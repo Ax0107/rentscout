@@ -14,6 +14,7 @@ import hashlib
 import json
 import logging
 import os
+from itertools import zip_longest
 from typing import Any, Dict, List, Optional
 
 import redis.asyncio as aioredis
@@ -294,13 +295,22 @@ async def search(
     # поэтому воркер дёргает каждый источник один раз и параллельно.
     results = await asyncio.gather(*(_run_source(k, location, filters) for k in SOURCES))
 
-    merged: List[Dict[str, Any]] = []
     per_source: Dict[str, int] = {}
+    lists: List[List[Dict[str, Any]]] = []
     for key, items in zip(SOURCES.keys(), results):
         for it in items:
             it["id"] = make_item_id(it.get("source", key), it.get("url", ""))
         per_source[key] = len(items)
-        merged.extend(items)
+        lists.append(items)
+
+    # Чередуем площадки. Источники склеены последовательно (cian→yandex→domclick),
+    # и срез merged[:per_page] заполнялся целиком первым — Яндекс и Домклик в
+    # выдачу не попадали, хотя объявления у них есть.
+    merged: List[Dict[str, Any]] = []
+    for group in zip_longest(*lists):
+        for x in group:
+            if x is not None:
+                merged.append(x)
 
     source_links = [{"key": k, "label": v[0], "url": v[2]} for k, v in SOURCES.items()]
     payload = {
