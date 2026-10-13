@@ -21,6 +21,7 @@ from app.utils.parser_errors import (
 from app.utils.retry import retry
 from app.utils.ratelimiter import rate_limiter
 from app.utils.circuit_breaker import get_circuit_breaker, CircuitBreakerOpen
+from app.utils.property_type import detect_from_text, detect_from_url
 
 logger = logging.getLogger(__name__)
 
@@ -192,15 +193,22 @@ class YandexRealtyParser(BaseParser):
         elif location.lower() in ["санкт-петербург", "spb", "saint petersburg"]:
             query_params["region"] = "10935"
             
-        # Add property type filter
+        # Тип объекта. AIOPA шлёт английские имена, а здесь ждали русские —
+        # фильтр не применялся, и объекту штамповалось имя среза. Понимаем оба.
         if params and "type" in params:
-            property_type = params["type"].lower()
-            if property_type == "квартира":
-                query_params["living_space"] = "flat"
-            elif property_type == "комната":
-                query_params["living_space"] = "room"
-            elif property_type == "дом":
-                query_params["living_space"] = "house"
+            spaces = {
+                "квартира": "flat", "apartment": "flat", "flat": "flat",
+                "комната": "room", "room": "room",
+                "дом": "house", "house": "house", "townhouse": "house",
+            }
+            space = spaces.get(str(params["type"]).lower())
+            if space:
+                query_params["living_space"] = space
+            else:
+                logger.warning(
+                    "yandex: тип '%s' не выражается в запросе — срез идёт без фильтра типа",
+                    params["type"],
+                )
                 
         # Add price filters
         if params and "min_price" in params and params["min_price"]:
@@ -269,13 +277,30 @@ class YandexRealtyParser(BaseParser):
                 # Extract additional information
                 location = self._extract_location(item, title)
                 description = self._extract_description(item)
-                
+
+                # Тип — из самой карточки: alt картинки («Дом …»/«Комната …»),
+                # затем заголовок, затем маршрут (/snyat/kvartira/). Не из
+                # среза запроса: площадка могла вернуть не то, что просили.
+                ptype = None
+                for img in img_elements:
+                    ptype = detect_from_text(img.get("alt"))
+                    if ptype:
+                        break
+                if not ptype:
+                    ptype = detect_from_text(title)
+                if not ptype:
+                    for a in item.select("a[href]"):
+                        ptype = detect_from_url(a.get("href"))
+                        if ptype:
+                            break
+
                 props = {
                     "source": "yandex_realty",
                     "external_id": self._extract_external_id(link),
                     "title": title,
                     "price": price,
                     "link": link,
+                    "property_type": ptype,
                     "rooms": rooms,
                     "area": area,
                     "photos": photos[:5],  # Limit to 5 photos

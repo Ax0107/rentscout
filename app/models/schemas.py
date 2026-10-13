@@ -17,6 +17,11 @@ class PropertyBase(BaseModel):
     currency: Optional[str] = Field("RUB", description="Валюта цены", examples=["RUB"])
     price_per_sqm: Optional[float] = Field(None, ge=0, description="Цена за квадратный метр")
 
+    property_type: Optional[str] = Field(
+        None,
+        description="Тип объекта из данных площадки (apartment/house/room/…)",
+        examples=["apartment", "house"],
+    )
     rooms: Optional[int] = Field(None, ge=0, description="Количество комнат")
     area: Optional[float] = Field(None, ge=0, description="Площадь в кв.м")
     floor: Optional[int] = Field(None, ge=0, description="Этаж")

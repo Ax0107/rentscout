@@ -22,6 +22,7 @@ from app.utils.parser_errors import (
 from app.utils.retry import retry
 from app.utils.ratelimiter import rate_limiter
 from app.utils.circuit_breaker import get_circuit_breaker, CircuitBreakerOpen
+from app.utils.property_type import detect_from_text, detect_from_url, normalize
 
 logger = logging.getLogger(__name__)
 
@@ -228,12 +229,36 @@ class DomclickParser(BaseParser):
                 len(range(0, end, limit)),
                 pages,
             )
+        # Категория/тип из запроса (у дома и коммерции своя выдача; иначе — квартира).
+        category, offer_type = self._api_category(params)
         common = (
             f"address={guid}&limit={limit}&sort=qi&sort_dir=desc"
-            f"&deal_type={deal}&category=living&offer_type=flat"
+            f"&deal_type={deal}&category={category}&offer_type={offer_type}"
         )
-        urls = [f"{DOMCLICK_API}?offset={o}&{common}" for o in range(0, end, limit)]
+        # Фильтры — В ЗАПРОС к площадке, а не только в локальную нарезку:
+        # тогда разные срезы тянут РАЗНЫЕ страницы выдачи, а не одни и те же.
+        extra = self._api_filters(params)
 
+        items = await self._api_pages(limit, end, common + extra)
+        pages_count = (end + limit - 1) // limit
+
+        # Фильтры/тип API не понял (пустая выдача) — повторяем «как раньше»:
+        # собрать больше важнее, чем сузить на стороне площадки.
+        if not items and (extra or (category, offer_type) != ("living", "flat")):
+            logger.warning("Domclick: пусто с фильтрами/типом — повтор базовым запросом")
+            items = await self._api_pages(limit, end, (
+                f"address={guid}&limit={limit}&sort=qi&sort_dir=desc"
+                f"&deal_type={deal}&category=living&offer_type=flat"
+            ))
+
+        logger.info(f"Domclick API: {len(items)} items from {pages_count} pages")
+        return self._parse_api_items(items)
+
+    async def _api_pages(self, limit: int, end: int, query: str) -> list:
+        """Забрать страницы BFF-API и собрать «сырые» items."""
+        from app.utils.fetch import fetch_many
+
+        urls = [f"{DOMCLICK_API}?offset={o}&{query}" for o in range(0, end, limit)]
         bodies = await fetch_many(
             urls,
             concurrency=DOMCLICK_CONCURRENCY,
@@ -250,8 +275,65 @@ class DomclickParser(BaseParser):
             except Exception as e:
                 logger.warning(f"Domclick API: bad json: {e}")
 
-        logger.info(f"Domclick API: {len(items)} items from {len(urls)} pages")
-        return self._parse_api_items(items)
+        return items
+
+    @staticmethod
+    def _api_filters(params: Dict[str, Any]) -> str:
+        """Наши фильтры → query-параметры BFF-search.
+
+        price__gte/lte, area__gte/lte, floor__gte/lte, rooms. Пусто — без фильтров.
+        """
+        p = params or {}
+
+        def num(key: str):
+            v = p.get(key)
+            if v in (None, ""):
+                return None
+            try:
+                return int(float(v))
+            except (TypeError, ValueError):
+                return None
+
+        out = []
+        for key, op in (
+            ("price_min", "price__gte"), ("price_max", "price__lte"),
+            ("area_min", "area__gte"), ("area_max", "area__lte"),
+            ("floor_min", "floor__gte"), ("floor_max", "floor__lte"),
+        ):
+            v = num(key)
+            if v:
+                out.append(f"{op}={v}")
+
+        rooms = num("rooms")
+        if rooms:
+            out.append(f"rooms={rooms}")
+
+        if str(p.get("not_first_floor")) in ("1", "true", "True") and not num("floor_min"):
+            out.append("floor__gt=1")
+
+        return ("&" + "&".join(out)) if out else ""
+
+    @staticmethod
+    def _api_category(params: Dict[str, Any]) -> tuple:
+        """Наш тип → (category, offer_type) BFF-search.
+
+        Для квартиры — проверенная пара living/flat. Остальное — предположение;
+        если площадка его не поймёт, вызов повторится базовой парой
+        (см. _fetch_via_api), поэтому попытка безопасна.
+        """
+        t = str((params or {}).get("type") or "apartment").lower()
+
+        mapping = {
+            "house":      ("living", "house"),
+            "townhouse":  ("living", "house"),
+            "garage":     ("living", "parking"),
+            "commercial": ("commercial", "office"),
+            "office":     ("commercial", "office"),
+            "warehouse":  ("commercial", "warehouse"),
+            "land":       ("land", "land"),
+        }
+
+        return mapping.get(t, ("living", "flat"))
 
     def _parse_api_items(self, items: list) -> List[PropertyCreate]:
         """Преобразовать items из API Домклика в PropertyCreate."""
@@ -262,6 +344,9 @@ class DomclickParser(BaseParser):
                 loc = it.get("location") or {}
                 house = it.get("house") or {}
                 addr = (it.get("address") or {}).get("displayName")
+                # Тип — из самого предложения (offerType/path карточки),
+                # а не из среза запроса: фильтр площадка может проигнорировать.
+                ptype = normalize(it.get("offerType")) or detect_from_url(it.get("path"))
 
                 bits = []
                 if info.get("rooms"):
@@ -287,6 +372,7 @@ class DomclickParser(BaseParser):
                     title=title,
                     price=float(it.get("price") or 0),
                     link=it.get("path"),
+                    property_type=ptype,
                     rooms=info.get("rooms"),
                     area=info.get("area"),
                     floor=info.get("floor"),
@@ -364,6 +450,7 @@ class DomclickParser(BaseParser):
                     description=it.get("description"),
                     link=f"{DOMCLICK_SHORT_BASE}/card/{oid}" if oid else None,
                     price=float(it.get("pricePerNight") or it.get("finalPrice") or 0),
+                    property_type=normalize(it.get("category")) or detect_from_text(it.get("title")),
                     rooms=it.get("rooms"),
                     area=it.get("area"),
                     city=geo.get("cityName"),
@@ -416,6 +503,12 @@ class DomclickParser(BaseParser):
                 info = o.get("generalInfo") or {}
                 loc = o.get("location") or {}
                 addr = (o.get("address") or {}).get("displayName")
+                # Тип — из самого оффера (SSR-состояние), не из среза запроса.
+                ptype = (
+                    normalize(o.get("offerType"))
+                    or normalize((o.get("generalInfo") or {}).get("offerType"))
+                    or detect_from_url(o.get("path"))
+                )
 
                 bits = []
                 if info.get("rooms"):
@@ -445,6 +538,7 @@ class DomclickParser(BaseParser):
                     "title": title,
                     "price": float(o.get("price") or 0),
                     "link": o.get("path"),
+                    "property_type": ptype,
                     "rooms": info.get("rooms"),
                     "area": info.get("area"),
                     "floor": info.get("minFloor"),

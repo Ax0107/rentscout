@@ -24,6 +24,7 @@ from fastapi import FastAPI, HTTPException, Query
 from app.parsers.cian.parser import CianParser
 from app.parsers.domclick.parser import DomclickParser
 from app.parsers.yandex_realty.parser import YandexRealtyParser
+from app.utils.property_type import normalize
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("wrapper")
@@ -121,7 +122,9 @@ def _to_item(p: Any, source: str, operation: str, property_type: str) -> Optiona
         "subtitle":       None,
         "operation":      op_norm,
         "operation_type": op_norm,
-        "property_type":  property_type,
+        # Тип — из данных объекта; имя среза только фолбэк. Иначе срез
+        # --types=house размечал квартиры как «дома».
+        "property_type":  getattr(p, "property_type", None) or property_type,
         "price":          format_price(price_raw),
         "price_raw":      price_raw,
         "price_per_m":    price_per_m,
@@ -166,9 +169,16 @@ def _apply_filters(items: List[Dict[str, Any]], filters: Dict[str, Any]) -> List
     fmin, fmax = _num(filters.get("floor_min")), _num(filters.get("floor_max"))
     nff = _truthy(filters.get("not_first_floor"))
     lastf = _truthy(filters.get("only_last_floor"))
+    # Тип запроса — только когда он ЯВНО задан: объекты с известным, но другим
+    # типом отбрасываем, чтобы срез --types=house не содержал квартир. Тип
+    # неизвестен — не трогаем (как и остальные фильтры).
+    want_type = normalize(filters.get("type"))
 
     out = []
     for it in items:
+        if want_type and it.get("property_type") and normalize(it["property_type"]) != want_type:
+            continue
+
         price = it.get("price_raw") or 0
         if price:
             if pmin and price < pmin:
@@ -237,6 +247,12 @@ async def _run_source(key: str, location: str, filters: Dict[str, Any], timeout:
             continue
         seen.add(it["url"])
         items.append(it)
+    # raw=1 — режим сбора: отдаём всё, что нашли парсеры, без локальной
+    # нарезки по фильтрам (коллектор собирает максимум, а не сужает выдачу;
+    # фильтры при этом всё равно уходят в запрос к площадке).
+    if _truthy(filters.get("raw")):
+        return items
+
     return _apply_filters(items, filters)
 
 
@@ -335,6 +351,8 @@ async def search(
     # Не задан — отдаём ВСЁ собранное. Задан — страница merged[offset:offset+per_page].
     per_page:  Optional[int] = Query(None, ge=1, le=SEARCH_MAX_PER_PAGE),
     pages:     Optional[int] = Query(None, ge=1, le=200),
+    # raw=1 — режим СБОРА: не режем выдачу фильтрами (collect max, а не сужение).
+    raw:       Optional[str] = Query(None),
 ):
     filters = {k: v for k, v in {
         "search": search, "city": city, "type": type, "operation": operation,
@@ -342,7 +360,7 @@ async def search(
         "area_min": area_min, "area_max": area_max,
         "floor_min": floor_min, "floor_max": floor_max,
         "not_first_floor": not_first_floor, "only_last_floor": only_last_floor,
-        "pages": pages,
+        "pages": pages, "raw": raw,
     }.items() if v not in (None, "")}
 
     location = filters.get("city") or "Москва"

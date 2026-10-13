@@ -21,6 +21,7 @@ from app.utils.parser_errors import (
 from app.utils.retry import retry
 from app.utils.ratelimiter import rate_limiter
 from app.utils.circuit_breaker import get_circuit_breaker, CircuitBreakerOpen
+from app.utils.property_type import detect_from_text, detect_from_url
 
 logger = logging.getLogger(__name__)
 
@@ -184,15 +185,24 @@ class CianParser(BaseParser):
         elif location.lower() in ["санкт-петербург", "spb", "saint petersburg"]:
             query_params["region"] = "2"
             
-        # Add property type filter
+        # Тип объекта. AIOPA шлёт АНГЛИЙСКИЕ имена (apartment/house/…), а здесь
+        # исторически ждали русские — из-за этого фильтр не применялся вовсе,
+        # и воркер штамповал объекту имя среза. Понимаем оба набора; чего не
+        # умеем выразить — не выдаём за отфильтрованное (только пишем в лог).
         if params and "type" in params:
-            property_type = params["type"].lower()
-            if property_type == "квартира":
-                query_params["type"] = "4"
-            elif property_type == "комната":
-                query_params["type"] = "5"
-            elif property_type == "дом":
-                query_params["type"] = "3"
+            codes = {
+                "квартира": "4", "apartment": "4", "flat": "4",
+                "комната": "5", "room": "5",
+                "дом": "3", "house": "3", "townhouse": "3",
+            }
+            code = codes.get(str(params["type"]).lower())
+            if code:
+                query_params["type"] = code
+            else:
+                logger.warning(
+                    "cian: тип '%s' не выражается в запросе — срез идёт без фильтра типа",
+                    params["type"],
+                )
                 
         # Add price filters
         if params and "min_price" in params and params["min_price"]:
@@ -275,13 +285,15 @@ class CianParser(BaseParser):
                     if isinstance(x, dict) and x.get("value")
                 ) or None
                 cian_id = o.get("cianId")
+                link = f"{self.BASE_URL}/rent/flat/{cian_id}/" if cian_id else None
                 results.append(PropertyCreate(
                     source="cian",
                     external_id=str(cian_id or ""),
                     title=obj_type or "Посуточная аренда Циан",
                     description=(o.get("description") or "")[:2000] or None,
-                    link=f"{self.BASE_URL}/rent/flat/{cian_id}/" if cian_id else None,
+                    link=link,
                     price=float(price or 0),
+                    property_type=detect_from_text(obj_type) or detect_from_url(link),
                     rooms=rooms,
                     area=self._extract_area_from_title(feats.get("totalArea") or ""),
                     floor=floor,
@@ -322,6 +334,7 @@ class CianParser(BaseParser):
                     title=title,
                     link=link or None,
                     price=price,
+                    property_type=detect_from_text(title) or detect_from_url(link),
                     rooms=self._extract_rooms_from_title(title),
                     area=self._extract_area_from_title(title),
                     photos=photos[:5],
@@ -382,6 +395,9 @@ class CianParser(BaseParser):
                     "title": title,
                     "price": price,
                     "link": link,
+                    # Тип — из маршрута карточки (/rent/flat/, /rent/suburban/),
+                    # с фолбэком на подпись: не из среза запроса.
+                    "property_type": detect_from_url(link) or detect_from_text(title),
                     "rooms": rooms,
                     "area": area,
                     "photos": photos[:5],  # Limit to 5 photos
