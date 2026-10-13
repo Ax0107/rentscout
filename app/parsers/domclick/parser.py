@@ -29,6 +29,12 @@ logger = logging.getLogger(__name__)
 DOMCLICK_API = "https://bff-search-web.domclick.ru/api/offers/v1"
 DOMCLICK_PAGE_LIMIT = int(os.getenv("DOMCLICK_PAGE_LIMIT", "30"))
 DOMCLICK_PAGES = int(os.getenv("DOMCLICK_PAGES", "30"))
+# Жёсткий верхний предел пагинации BFF-search: глубже API отдаёт http=400
+# ({"message":"ApiError status: Bad Request"}) и это не ошибка сети. Проверено
+# 2026-10-14 против живого API: offset 1950 → 200, offset 1980 → 400 при limit=30,
+# т.е. сервер отдаёт максимум 1980 результатов. Обход прекращаем, как только
+# offset достиг этого значения: дальше только гарантированные 400 и лишнее время.
+DOMCLICK_MAX_OFFSET = int(os.getenv("DOMCLICK_MAX_OFFSET", "1980"))
 DOMCLICK_CONCURRENCY = int(os.getenv("DOMCLICK_CONCURRENCY", "6"))
 # Хост картинок: API отдаёт относительные пути (/rent/offer/…, /vitrina/…),
 # а на самом domclick.ru они дают 404. Рабочий хост — img.domclick.ru.
@@ -211,11 +217,22 @@ class DomclickParser(BaseParser):
 
         limit = DOMCLICK_PAGE_LIMIT
         pages = int((params or {}).get("pages") or DOMCLICK_PAGES)
+        # Останавливаем обход, как только offset достиг лимита (offset >= MAX → 400),
+        # чтобы не тратить время на страницы, которые API всё равно отклонит.
+        end = min(limit * pages, DOMCLICK_MAX_OFFSET)
+        if limit * pages > end:
+            logger.info(
+                "Domclick API: достигнут предел пагинации (offset < %s) — "
+                "обход остановлен на %s из %s страниц",
+                DOMCLICK_MAX_OFFSET,
+                len(range(0, end, limit)),
+                pages,
+            )
         common = (
             f"address={guid}&limit={limit}&sort=qi&sort_dir=desc"
             f"&deal_type={deal}&category=living&offer_type=flat"
         )
-        urls = [f"{DOMCLICK_API}?offset={o}&{common}" for o in range(0, limit * pages, limit)]
+        urls = [f"{DOMCLICK_API}?offset={o}&{common}" for o in range(0, end, limit)]
 
         bodies = await fetch_many(
             urls,

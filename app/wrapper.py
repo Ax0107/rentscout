@@ -32,6 +32,11 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
 CACHE_TTL = 600      # 10 min — выдача поиска
 ITEM_TTL  = 86400    # 24h — отдельные карточки
 
+# Окно отдачи /search. per_page по умолчанию НЕ задан — воркер отдаёт всё,
+# что собрал (карте и диалогу тысяча объектов — нормально). Значение ниже —
+# только предохранитель для явного per_page, а не политика.
+SEARCH_MAX_PER_PAGE = max(1, int(os.getenv("SEARCH_MAX_PER_PAGE", "5000")))
+
 # Ключ источника → (человеческое имя, класс парсера, корневой URL площадки)
 # avito убран: с него жёсткий IP-бан (403/429), из выдачи он приносит 0 и
 # только жжёт время и дёргает предохранитель. Вернём, когда будет чистый IP.
@@ -327,7 +332,8 @@ async def search(
     not_first_floor:  Optional[str] = Query(None),
     only_last_floor:  Optional[str] = Query(None),
     page:      int = Query(1, ge=1),
-    per_page:  int = Query(200, ge=1, le=300),
+    # Не задан — отдаём ВСЁ собранное. Задан — страница merged[offset:offset+per_page].
+    per_page:  Optional[int] = Query(None, ge=1, le=SEARCH_MAX_PER_PAGE),
     pages:     Optional[int] = Query(None, ge=1, le=200),
 ):
     filters = {k: v for k, v in {
@@ -341,8 +347,11 @@ async def search(
 
     location = filters.get("city") or "Москва"
 
+    # page/per_page входят в ключ: иначе вторая страница вернула бы
+    # закэшированную первую.
     cache_key = "aiopa:ext:" + json.dumps(
-        {**filters, "_city": location}, sort_keys=True, ensure_ascii=False
+        {**filters, "_city": location, "_page": page, "_per_page": per_page},
+        sort_keys=True, ensure_ascii=False,
     )
     cached = await cache_get(cache_key)
     if cached:
@@ -370,13 +379,23 @@ async def search(
             if x is not None:
                 merged.append(x)
 
+    # Без per_page окна нет вовсе — отдаём всё собранное (потерь быть не должно).
+    # С per_page — обычная страница со смещением.
+    if per_page:
+        offset = max(0, (page - 1) * per_page)
+        window = merged[offset:offset + per_page]
+    else:
+        offset = 0
+        window = merged
+
     source_links = [{"key": k, "label": v[0], "url": v[2]} for k, v in SOURCES.items()]
     payload = {
-        "items": merged[:per_page],
+        "items": window,
         "per_source": per_source,
         "total": len(merged),
         "page": page,
         "per_page": per_page,
+        "has_more": per_page is not None and (offset + len(window)) < len(merged),
         "source_links": source_links,
         "filters": filters,
     }
