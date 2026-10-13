@@ -48,6 +48,10 @@ services:
       - DATABASE_URL=postgresql+asyncpg://rentscout:${POSTGRES_PASSWORD:?}@postgres:5432/rentscout
       - PYTHONUNBUFFERED=1
       - LOG_LEVEL=INFO
+      # Браузер для Домклика (Qrator): chromium из образа, без окна
+      # (в контейнере нет дисплея; при необходимости вернём через Xvfb).
+      - RENDER_CHANNEL=chromium
+      - RENDER_HEADFUL=0
     depends_on:
       postgres:
         condition: service_healthy
