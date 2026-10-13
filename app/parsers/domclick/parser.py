@@ -33,6 +33,13 @@ DOMCLICK_CONCURRENCY = int(os.getenv("DOMCLICK_CONCURRENCY", "6"))
 # Хост картинок: API отдаёт относительные пути (/rent/offer/…, /vitrina/…),
 # а на самом domclick.ru они дают 404. Рабочий хост — img.domclick.ru.
 DOMCLICK_IMG = os.getenv("DOMCLICK_IMG", "https://img.domclick.ru")
+# Посуточная (краткосрочная) аренда Домклика живёт на отдельном сервисе
+# 24.domclick.ru: свой API (нужны город и диапазон дат) и свои карточки /card/<id>.
+# В bff-search-web крaткосрочного режима в deal_type нет.
+DOMCLICK_SHORT_API = "https://24.domclick.ru/api/offers/v1"
+DOMCLICK_SHORT_BASE = "https://24.domclick.ru"
+DOMCLICK_SHORT_PAGES = int(os.getenv("DOMCLICK_SHORT_PAGES", "10"))
+DOMCLICK_SHORT_PAGE_LIMIT = int(os.getenv("DOMCLICK_SHORT_PAGE_LIMIT", "30"))
 
 
 class DomclickParser(BaseParser):
@@ -71,6 +78,20 @@ class DomclickParser(BaseParser):
         guid = self.CITY_GUIDS.get((location or "").strip().lower())
 
         await rate_limiter.acquire("domclick")
+
+        # Посуточная аренда — отдельный сервис 24.domclick.ru (у bff-search-web
+        # в deal_type нет краткосрочного режима).
+        if op == "rent_short":
+            if not guid:
+                logger.warning(f"Domclick short-term: нет guid города {location!r}")
+                return []
+            try:
+                short_items = await self._fetch_short_via_api(guid, processed_params)
+            except Exception as e:
+                parser_error = ParserErrorHandler.convert_to_parser_exception(e)
+                ParserErrorHandler.log_error(parser_error, context="DomclickParser._parse_internal(short)")
+                raise parser_error
+            return await self.postprocess_results(short_items)
 
         try:
             # 1) Лёгкий путь — BFF-search API Домклика (без браузера, с пагинацией).
@@ -262,6 +283,81 @@ class DomclickParser(BaseParser):
                 ))
             except Exception as e:
                 logger.error(f"Domclick API item error: {e}")
+        return results
+
+    async def _fetch_short_via_api(self, guid: str, params: Dict[str, Any]) -> List[PropertyCreate]:
+        """Посуточная выдача Домклика (24.domclick.ru): город + диапазон дат.
+
+        API отдаёт цену за ночь (pricePerNight), поэтому диапазон дат не сужает
+        выборку, а задаёт период для расчёта цены.
+        """
+        from datetime import date, timedelta
+
+        from app.utils.fetch import fetch_many
+
+        today = date.today()
+        date_begin = (today + timedelta(days=1)).isoformat()
+        date_end = (today + timedelta(days=3)).isoformat()
+
+        limit = DOMCLICK_SHORT_PAGE_LIMIT
+        pages = int((params or {}).get("pages") or DOMCLICK_SHORT_PAGES)
+        common = (
+            f"locationGuid={guid}&dateBegin={date_begin}&dateEnd={date_end}"
+            f"&adults=2&limit={limit}"
+        )
+        urls = [f"{DOMCLICK_SHORT_API}?offset={o}&{common}" for o in range(0, limit * pages, limit)]
+
+        bodies = await fetch_many(
+            urls,
+            concurrency=DOMCLICK_CONCURRENCY,
+            headers={"accept": "application/json"},
+        )
+
+        items: list = []
+        for body in bodies:
+            if not body:
+                continue
+            try:
+                data = json.loads(body)
+                items.extend(data.get("offers") or [])
+            except Exception as e:
+                logger.warning(f"Domclick24 API: bad json: {e}")
+
+        logger.info(f"Domclick24 API: {len(items)} offers from {len(urls)} pages")
+        return self._parse_short_items(items, date_begin, date_end)
+
+    def _parse_short_items(self, items: list, date_begin: str, date_end: str) -> List[PropertyCreate]:
+        """Преобразовать offers из API 24.domclick.ru в PropertyCreate."""
+        results: List[PropertyCreate] = []
+        for it in items:
+            try:
+                geo = it.get("geoInfo") or {}
+                photos = []
+                for ph in (it.get("photos") or [])[:5]:
+                    u = ph.get("url") if isinstance(ph, dict) else ph
+                    if u and u.startswith("/"):
+                        u = DOMCLICK_IMG + u
+                    if u:
+                        photos.append(u)
+                oid = str(it.get("id") or "")
+                results.append(PropertyCreate(
+                    source="domclick",
+                    external_id=oid,
+                    title=it.get("title") or "Посуточная аренда Домклик",
+                    description=it.get("description"),
+                    link=f"{DOMCLICK_SHORT_BASE}/card/{oid}" if oid else None,
+                    price=float(it.get("pricePerNight") or it.get("finalPrice") or 0),
+                    rooms=it.get("rooms"),
+                    area=it.get("area"),
+                    city=geo.get("cityName"),
+                    address=geo.get("displayName"),
+                    latitude=geo.get("lat"),
+                    longitude=geo.get("lon"),
+                    photos=photos,
+                    features={"rent_period": "day", "dates": f"{date_begin}..{date_end}"},
+                ))
+            except Exception as e:
+                logger.error(f"Domclick24 offer error: {e}")
         return results
 
     def _parse_html(self, html: str) -> list[PropertyCreate]:

@@ -31,6 +31,13 @@ CIAN_CONCURRENCY = int(os.getenv("CIAN_CONCURRENCY", "5"))
 
 class CianParser(BaseParser):
     BASE_URL = "https://www.cian.ru"
+
+    # Город → поддомен для посуточной выдачи (/snyat-kvartiru-posutochno/).
+    # На www.cian.ru регион в URL не учитывается, город задаётся поддоменом.
+    SHORT_SUBDOMAINS = {
+        "москва": "www", "moscow": "www",
+        "санкт-петербург": "spb", "спб": "spb", "saint petersburg": "spb",
+    }
     
     def __init__(self):
         super().__init__()
@@ -54,9 +61,20 @@ class CianParser(BaseParser):
         # Preprocess params
         processed_params = await self.preprocess_params(params)
 
-        # Build URL with params
-        url = f"{self.BASE_URL}/cat.php"
-        query_params = self._build_query_params(location, processed_params)
+        # Посуточная аренда — отдельный раздел Циана с другим фронтендом и
+        # разметкой (карточки на data-testid, данные готовым JSON "offers");
+        # обычный cat.php?deal_type=rent отдаёт только долгосрочную выдачу.
+        is_short = (processed_params or {}).get("operation") == "rent_short"
+        if is_short:
+            url = self._short_url(location)
+            query_params: Dict[str, str] = {}
+            parse_html = self._parse_short_html
+            pages = 1
+        else:
+            url = f"{self.BASE_URL}/cat.php"
+            query_params = self._build_query_params(location, processed_params)
+            parse_html = self._parse_html
+            pages = int((processed_params or {}).get("pages") or CIAN_PAGES)
 
         # Apply rate limiting
         await rate_limiter.acquire("cian")
@@ -68,7 +86,6 @@ class CianParser(BaseParser):
 
             from app.utils.fetch import fetch_many
 
-            pages = int((processed_params or {}).get("pages") or CIAN_PAGES)
             urls = []
             for p in range(1, pages + 1):
                 qp = dict(query_params)
@@ -83,7 +100,7 @@ class CianParser(BaseParser):
             for html in htmls:
                 if not html:
                     continue
-                for it in self._parse_html(html):
+                for it in parse_html(html):
                     link = getattr(it, "link", None)
                     if link and link in seen:
                         continue
@@ -98,8 +115,8 @@ class CianParser(BaseParser):
             from app.utils.http_pool import OptimizedHTTPClient
 
             async with OptimizedHTTPClient(name="cian") as client:
-                response = await client.get(url, params=query_params)
-                results = self._parse_html(response.text)
+                response = await client.get(url, params=query_params or None)
+                results = parse_html(response.text)
                 return await self.postprocess_results(results)
 
         except asyncio.TimeoutError as e:
@@ -199,7 +216,120 @@ class CianParser(BaseParser):
                     query_params.update({rp: "1" for rp in room_params})
                         
         return query_params
-        
+
+    def _short_url(self, location: str) -> str:
+        """URL посуточной выдачи Циана для города (Москва → www.cian.ru)."""
+        sub = self.SHORT_SUBDOMAINS.get((location or "").strip().lower(), "www")
+        return f"https://{sub}.cian.ru/snyat-kvartiru-posutochno/"
+
+    def _parse_short_html(self, html: str) -> list[PropertyCreate]:
+        """Посуточная выдача Циана (раздел /snyat-kvartiru-posutochno/).
+
+        У неё другой фронтенд (dailyrent-search-frontend): данные лежат готовым
+        JSON в "offers":[...] — цена за сутки, площадь, фото, гео. Если JSON не
+        нашёлся — разбираем карточки по data-testid.
+        """
+        offers = self._extract_short_json(html)
+        if offers:
+            return self._short_from_json(offers)
+        return self._short_from_dom(html)
+
+    @staticmethod
+    def _extract_short_json(html: str) -> list:
+        """Вытащить массив offers из встроенного JSON страницы посуточной выдачи."""
+        import json
+
+        marker = '"offers":['
+        i = html.find(marker)
+        if i < 0:
+            return []
+        try:
+            arr, _ = json.JSONDecoder().raw_decode(html[i + len(marker) - 1:].strip())
+        except Exception:
+            return []
+        return [o for o in arr if isinstance(o, dict) and o.get("cianId")]
+
+    def _short_from_json(self, offers: list) -> list[PropertyCreate]:
+        results: list[PropertyCreate] = []
+        for o in offers:
+            try:
+                feats = o.get("features") or {}
+                geo = o.get("geo") or {}
+                price = (o.get("price") or {}).get("value") or 0
+                obj_type = feats.get("objectType") or ""
+                rooms = self._extract_rooms_from_title(obj_type)
+                if rooms is None and "студия" in obj_type.lower():
+                    rooms = 0
+                floor = total_floors = None
+                m = re.match(r"\s*(\d+)\s*/\s*(\d+)", feats.get("floorInfo") or "")
+                if m:
+                    floor, total_floors = int(m.group(1)), int(m.group(2))
+                photos = [
+                    p.get("url") for p in (o.get("media") or [])
+                    if isinstance(p, dict) and p.get("url")
+                ]
+                coords = geo.get("coordinates") or {}
+                addr = geo.get("address") or []
+                address = ", ".join(
+                    x.get("value", "") for x in addr
+                    if isinstance(x, dict) and x.get("value")
+                ) or None
+                cian_id = o.get("cianId")
+                results.append(PropertyCreate(
+                    source="cian",
+                    external_id=str(cian_id or ""),
+                    title=obj_type or "Посуточная аренда Циан",
+                    description=(o.get("description") or "")[:2000] or None,
+                    link=f"{self.BASE_URL}/rent/flat/{cian_id}/" if cian_id else None,
+                    price=float(price or 0),
+                    rooms=rooms,
+                    area=self._extract_area_from_title(feats.get("totalArea") or ""),
+                    floor=floor,
+                    total_floors=total_floors,
+                    address=address,
+                    latitude=coords.get("lat"),
+                    longitude=coords.get("lng"),
+                    photos=photos[:5],
+                    location=geo or None,
+                ))
+            except Exception as e:
+                logger.error(f"Error parsing cian short offer: {e}")
+        return results
+
+    def _short_from_dom(self, html: str) -> list[PropertyCreate]:
+        """Фолбэк: разбор карточек посуточной выдачи по data-testid."""
+        soup = BeautifulSoup(html, "lxml")
+        results: list[PropertyCreate] = []
+        for card in soup.select("[data-testid='OfferCard']"):
+            try:
+                link_el = card.select_one("a[href*='/rent/flat/']")
+                link = link_el.get("href", "") if link_el else ""
+                if link and not link.startswith("http"):
+                    link = self.BASE_URL + link
+                price_el = card.select_one("[data-testid='price']")
+                price_text = price_el.get_text(" ", strip=True) if price_el else ""
+                m_price = re.search(r"\d[\d\s\u00a0]*", price_text)
+                price = float(re.sub(r"\D", "", m_price.group(0))) if m_price else 0
+                img = card.select_one("img[alt]")
+                title = (img.get("alt") if img else "") or "Посуточная аренда Циан"
+                photos = [
+                    i.get("src") for i in card.select("img")
+                    if i.get("src") and "placeholder" not in i["src"]
+                ]
+                results.append(PropertyCreate(
+                    source="cian",
+                    external_id=self._extract_external_id(link),
+                    title=title,
+                    link=link or None,
+                    price=price,
+                    rooms=self._extract_rooms_from_title(title),
+                    area=self._extract_area_from_title(title),
+                    photos=photos[:5],
+                ))
+            except Exception as e:
+                logger.error(f"Error parsing cian short card: {e}")
+        return results
+
     def _parse_html(self, html: str) -> list[PropertyCreate]:
         soup = BeautifulSoup(html, "lxml")
         properties = []

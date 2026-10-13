@@ -71,7 +71,11 @@ class YandexRealtyParser(BaseParser):
         slug = self.CITY_SLUGS.get(location.strip().lower(), "rossiya")
         op = (processed_params or {}).get("operation", "rent_long")
         deal = "kupit" if op == "sell" else "snyat"
+        # Посуточная аренда — отдельный раздел выдачи: /{city}/snyat/kvartira/posutochno/
+        # (та же разметка OffersSerpItem, но цена за сутки).
         url = f"{self.BASE_URL}/{slug}/{deal}/kvartira/"
+        if op == "rent_short":
+            url += "posutochno/"
 
         q: Dict[str, Any] = {}
         if processed_params:
