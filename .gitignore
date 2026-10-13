@@ -152,3 +152,8 @@ dump.rdb
 
 # Ruff
 .ruff_cache/
+AGENTS.md
+IDENTITY.md
+SOUL.md
+USER.md
+memory/
